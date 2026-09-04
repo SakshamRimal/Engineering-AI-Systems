@@ -1,0 +1,12 @@
+myenv/
+vllm-env/
+__pycache__/
+*.pyc
+.env
+.git/
+.gitignore
+data/chroma_db/
+*.md
+tests/
+README.md
+.pytest_cache/
