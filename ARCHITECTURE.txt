@@ -1,0 +1,92 @@
+Architecture: AI Assistant Production Deployment
+================================================
+
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Client (Browser)                             │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ HTTP
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Streamlit UI (:8501)                            │
+│  ┌──────────────┐  ┌──────────────┐  ┌────────────────────────┐    │
+│  │ Chat History  │  │ Mode Selector│  │ Backend Health + Cache │    │
+│  └──────────────┘  └──────────────┘  └────────────────────────┘    │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │ HTTP (REST)
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                  FastAPI Backend (:8000)                             │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐      │
+│  │  Middleware Stack                                         │      │
+│  │  ┌────────────────┐ ┌────────────┐ ┌─────────────────┐  │      │
+│  │  │ Request ID +   │ │ Rate       │ │ Error Handling  │  │      │
+│  │  │ Response Time  │ │ Limiter    │ │ (catch-all)     │  │      │
+│  │  └────────────────┘ └────────────┘ └─────────────────┘  │      │
+│  └──────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐      │
+│  │  Endpoints                                                │      │
+│  │  POST /chat          - Plain LLM chat                     │      │
+│  │  POST /chat/tools    - Chat with tool calling             │      │
+│  │  POST /chat/rag      - RAG with structured output         │      │
+│  │  POST /ingest        - Background document ingestion      │      │
+│  │  GET  /health        - Health + circuit breaker + cache   │      │
+│  │  GET  /cache/stats   - Cache hit/miss statistics          │      │
+│  │  POST /cache/invalidate - Clear cache                     │      │
+│  └──────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐      │
+│  │  LLM Client Layer                                         │      │
+│  │  ┌───────────────┐ ┌────────────┐ ┌──────────────────┐  │      │
+│  │  │ Retry +       │ │ Response   │ │ Circuit Breaker  │  │      │
+│  │  │ Exponential   │ │ Cache      │ │ (fail-open to    │  │      │
+│  │  │ Backoff       │ │ (LRU+TTL)  │ │  fallback)       │  │      │
+│  │  └───────┬───────┘ └────────────┘ └────────┬─────────┘  │      │
+│  │         │                                   │             │      │
+│  │         ▼                                   ▼             │      │
+│  │  ┌─────────────────┐            ┌──────────────────┐     │      │
+│  │  │ Primary LLM     │            │ Fallback LLM     │     │      │
+│  │  │ (OpenAI/vLLM)   │───────────▶│ (Ollama local)   │     │      │
+│  │  └─────────────────┘   on fail  └──────────────────┘     │      │
+│  └──────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐      │
+│  │  RAG Pipeline                                             │      │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐   │      │
+│  │  │ Retriever    │  │ VectorStore  │  │ Ingest       │   │      │
+│  │  │ (ChromaDB    │  │ (ChromaDB +  │  │ (PDF/TXT/MD  │   │      │
+│  │  │  query)      │  │  MiniLM)     │  │  chunking)   │   │      │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘   │      │
+│  └──────────────────────────────────────────────────────────┘      │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────┐      │
+│  │  Tool System                                              │      │
+│  │  calculator | web_search | query_knowledge_base           │      │
+│  └──────────────────────────────────────────────────────────┘      │
+└─────────────────────────────────────────────────────────────────────┘
+                                │
+                                ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│              Persistent Storage (Docker Volumes)                     │
+│  ┌──────────────────┐  ┌──────────────────┐                        │
+│  │ ChromaDB         │  │ Document Store   │                        │
+│  │ (vectors + meta) │  │ (PDF/TXT/MD)     │                        │
+│  └──────────────────┘  └──────────────────┘                        │
+└─────────────────────────────────────────────────────────────────────┘
+
+Reliability Features:
+  - Retry with exponential backoff (3 attempts, capped wait)
+  - Rate limiting (30 req/min per client IP)
+  - Circuit breaker (opens after 5 failures, 30s recovery)
+  - Fallback provider (automatic switch on primary failure)
+  - Structured error responses (503/429/500 with details)
+  - Response caching (LRU, 256 entries, 5min TTL)
+  - Background ingestion (non-blocking)
+  - Request ID tracking (X-Request-ID header)
+  - Response time tracking (X-Response-Time header)
+
+Deployment Options:
+  - docker compose up (full stack)
+  - docker compose --profile ollama up (with local fallback LLM)
+  - Azure Container Apps / AWS ECS / Google Cloud Run
