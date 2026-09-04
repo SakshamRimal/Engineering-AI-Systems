@@ -1,25 +1,38 @@
-from openai import OpenAI, AsyncOpenAI
-from app.config import settings
+import json
+import logging
+import asyncio
 from typing import Any, cast
 
+import openai
+from openai import AsyncOpenAI
+
+from app.config import settings
 from app.tools import TOOL_DEFINITIONS, execute_tool
+from app.cache import response_cache
+from app.circuit_breaker import CircuitBreaker
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are a helpful, factual AI assistant.
 
 Rules you must follow:
-1. If the user's question relates to retrieved context provided to you, base your answer 
+1. If the user's question relates to retrieved context provided to you, base your answer
    primarily on that context. Do not use outside knowledge to contradict it.
-2. If no relevant context is provided and you don't know the answer, say so honestly 
+2. If no relevant context is provided and you don't know the answer, say so honestly
    instead of guessing.
 3. When you use a tool, wait for its result before answering — never fabricate a tool result.
 4. Keep answers concise and directly address the question asked.
-5. If asked to produce structured data, respond with valid JSON only, matching the 
+5. If asked to produce structured data, respond with valid JSON only, matching the
    requested schema exactly — no extra commentary, no markdown code fences.
 """
+
 
 class LLMClient:
     def __init__(self):
         self.provider = settings.LLM_PROVIDER
+        self._circuit_breaker = CircuitBreaker(
+            failure_threshold=5, recovery_timeout=30.0
+        )
 
         if self.provider == "openai":
             self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
@@ -30,6 +43,91 @@ class LLMClient:
         else:
             raise ValueError(f"Unknown LLM_PROVIDER: {self.provider}")
 
+        # Fallback client
+        self._fallback_client = None
+        self._fallback_model = None
+        if settings.FALLBACK_PROVIDER:
+            self._setup_fallback()
+
+    def _setup_fallback(self):
+        provider = settings.FALLBACK_PROVIDER
+        if provider in ("vllm", "ollama"):
+            self._fallback_client = AsyncOpenAI(
+                base_url=settings.FALLBACK_VLLM_BASE_URL, api_key="not-needed"
+            )
+            self._fallback_model = settings.FALLBACK_VLLM_MODEL
+            logger.info(f"Fallback provider configured: {provider} ({self._fallback_model})")
+
+    def _build_messages(
+        self, user_message: str, history: list[dict] | None = None,
+        system_prompt: str | None = None
+    ) -> list[dict]:
+        messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+        return messages
+
+    async def _call_with_retry(self, client, model, **kwargs) -> Any:
+        last_error = None
+        for attempt in range(settings.MAX_RETRIES):
+            try:
+                result = await client.chat.completions.create(model=model, **kwargs)
+                self._circuit_breaker.record_success()
+                return result
+            except (openai.APIConnectionError, openai.APITimeoutError, openai.RateLimitError) as e:
+                last_error = e
+                wait_time = min(
+                    settings.RETRY_BACKOFF_BASE * (2 ** attempt),
+                    settings.RETRY_MAX_WAIT,
+                )
+                logger.warning(
+                    f"LLM call failed (attempt {attempt + 1}/{settings.MAX_RETRIES}): {e}. "
+                    f"Retrying in {wait_time:.1f}s"
+                )
+                self._circuit_breaker.record_failure()
+                await asyncio.sleep(wait_time)
+            except openai.APIStatusError as e:
+                if e.status_code in (429, 500, 502, 503, 504):
+                    last_error = e
+                    wait_time = min(
+                        settings.RETRY_BACKOFF_BASE * (2 ** attempt),
+                        settings.RETRY_MAX_WAIT,
+                    )
+                    logger.warning(
+                        f"LLM API error {e.status_code} (attempt {attempt + 1}/{settings.MAX_RETRIES}): {e}. "
+                        f"Retrying in {wait_time:.1f}s"
+                    )
+                    self._circuit_breaker.record_failure()
+                    await asyncio.sleep(wait_time)
+                else:
+                    self._circuit_breaker.record_failure()
+                    raise
+            except Exception:
+                self._circuit_breaker.record_failure()
+                raise
+        raise last_error
+
+    async def _call_with_fallback(self, **kwargs) -> Any:
+        if not self._circuit_breaker.allow_request():
+            if self._fallback_client:
+                logger.warning("Circuit open, using fallback provider")
+                return await self._fallback_client.chat.completions.create(
+                    model=self._fallback_model, **kwargs
+                )
+            raise Exception("Primary LLM circuit breaker is open and no fallback configured")
+
+        try:
+            return await self._call_with_retry(self.client, self.model, **kwargs)
+        except Exception as e:
+            logger.error(f"Primary provider failed: {e}")
+            if self._fallback_client:
+                logger.info("Falling back to secondary provider")
+                return await self._fallback_client.chat.completions.create(
+                    model=self._fallback_model, **kwargs
+                )
+            raise
+
     async def chat(
         self,
         user_message: str,
@@ -39,19 +137,21 @@ class LLMClient:
         max_tokens: int = 800,
         system_prompt: str | None = None,
     ) -> str:
-        messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}]
-        if history:
-            messages.extend(history)
-        messages.append({"role": "user", "content": user_message})
+        messages = self._build_messages(user_message, history, system_prompt)
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
+        cached = response_cache.get(messages, self.model, temperature=temperature)
+        if cached is not None:
+            return cached
+
+        response = await self._call_with_fallback(
             messages=messages,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
         )
-        return response.choices[0].message.content
+        result = response.choices[0].message.content
+        response_cache.set(messages, self.model, result, temperature=temperature)
+        return result
 
     async def chat_structured(
         self,
@@ -77,11 +177,10 @@ class LLMClient:
 
         messages = [
             {"role": "system", "content": full_system},
-            {"role": "user", "content": user_content}
+            {"role": "user", "content": user_content},
         ]
 
-        response = await self.client.chat.completions.create(
-            model=self.model,
+        response = await self._call_with_fallback(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -106,8 +205,7 @@ class LLMClient:
         tool_calls_made = []
 
         for _ in range(max_iterations):
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._call_with_fallback(
                 messages=messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
@@ -143,8 +241,7 @@ class LLMClient:
                     "content": result,
                 })
 
-        final = await self.client.chat.completions.create(
-            model=self.model,
+        final = await self._call_with_fallback(
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -152,8 +249,6 @@ class LLMClient:
         return {"answer": final.choices[0].message.content, "tool_calls_made": tool_calls_made}
 
     async def _parse_json_with_repair(self, raw: str, original_messages: list[dict]) -> dict:
-        import json
-
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -161,8 +256,7 @@ class LLMClient:
                 {"role": "assistant", "content": raw},
                 {"role": "user", "content": "That was not valid JSON. Return ONLY the corrected valid JSON object, nothing else."},
             ]
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await self._call_with_fallback(
                 messages=repair_messages,
                 temperature=0,
                 max_tokens=800,
