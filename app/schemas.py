@@ -21,4 +21,4 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     sources: list[SourceRef] = []
-    confidence: float
+    confidence: float | None = None

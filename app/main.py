@@ -28,6 +28,7 @@ def chat(request: ChatRequest):
     Plain chat endpoint.No tools , no forced JSON , just conventional response"""
     try:
         answer = llm_client.chat(request.message , history=request.history)
+        return ChatResponse(answer=answer)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     

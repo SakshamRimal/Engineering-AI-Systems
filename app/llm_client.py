@@ -46,7 +46,8 @@ class LLMClient:
         """
         messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}]
         if history:
-            messages.extend(history)
+            valid_history = [msg for msg in history if msg and "role" in msg]
+            messages.extend(valid_history)
         messages.append({"role": "user", "content": user_message})
 
         response = self.client.chat.completions.create(
@@ -118,7 +119,8 @@ class LLMClient:
 
         messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
         if history:
-            messages.extend(history)
+            valid_history = [msg for msg in history if msg and "role" in msg]
+            messages.extend(valid_history)
         messages.append({"role": "user", "content": user_message})
 
         tool_calls_made = []
@@ -182,7 +184,7 @@ class LLMClient:
         except json.JSONDecodeError:
             # Repair attempt: ask the model to fix its own broken output
             repair_messages = original_messages + [
-                {"role": "assistant", "content": raw},
+                {"role": "assistant", "content": raw or ""},
                 {"role": "user", "content": "That was not valid JSON. Return ONLY the corrected valid JSON object, nothing else."},
             ]
             response = self.client.chat.completions.create(
