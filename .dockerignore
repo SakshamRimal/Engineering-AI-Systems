@@ -8,5 +8,7 @@ __pycache__/
 data/chroma_db/
 *.md
 tests/
-README.md
 .pytest_cache/
+.dockerignore
+Dockerfile
+docker-compose.yml
