@@ -25,8 +25,7 @@ class LLMClient:
         if self.provider == "openai":
             self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
             self.model = settings.OPENAI_MODEL
-        elif self.provider == "vllm":
-            # vLLM exposes an OpenAI-compatible server, so we reuse the same client class
+        elif self.provider in ("vllm", "ollama"):
             self.client = OpenAI(base_url=settings.VLLM_BASE_URL, api_key="not-needed")
             self.model = settings.VLLM_MODEL
         else:
