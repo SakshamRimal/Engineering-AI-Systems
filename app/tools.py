@@ -28,15 +28,19 @@ def web_search(query: str) -> dict:
     }
     
 def query_knowledge_base(query: str) -> dict:
-    """
-    Will call into the RAG system to query the knowledge base.
-    
-    """
+    """Retrieves relevant chunks from the vector store for the given query."""
+    from app.rag.retriever import retrieve
+
+    chunks = retrieve(query, top_k=4)
+    if not chunks:
+        return {"chunks": [], "note": "No relevant information found in knowledge base."}
+
     return {
-        "chunks": [],
-        "note":"RAG retrieval not implemented in this stub. Replace with actual RAG retrieval logic."
+        "chunks": [
+            {"document": c["metadata"]["source"], "chunk_id": c["chunk_id"], "text": c["text"]}
+            for c in chunks
+        ]
     }
-    
 
 # tool schemas (what we tell the model is available, and how to call it)
 
