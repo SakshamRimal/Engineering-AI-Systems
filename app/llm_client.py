@@ -1,0 +1,175 @@
+from openai import OpenAI, AsyncOpenAI
+from app.config import settings
+from typing import Any, cast
+
+from app.tools import TOOL_DEFINITIONS, execute_tool
+
+SYSTEM_PROMPT = """You are a helpful, factual AI assistant.
+
+Rules you must follow:
+1. If the user's question relates to retrieved context provided to you, base your answer 
+   primarily on that context. Do not use outside knowledge to contradict it.
+2. If no relevant context is provided and you don't know the answer, say so honestly 
+   instead of guessing.
+3. When you use a tool, wait for its result before answering — never fabricate a tool result.
+4. Keep answers concise and directly address the question asked.
+5. If asked to produce structured data, respond with valid JSON only, matching the 
+   requested schema exactly — no extra commentary, no markdown code fences.
+"""
+
+class LLMClient:
+    def __init__(self):
+        self.provider = settings.LLM_PROVIDER
+
+        if self.provider == "openai":
+            self.client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+            self.model = settings.OPENAI_MODEL
+        elif self.provider in ("vllm", "ollama"):
+            self.client = AsyncOpenAI(base_url=settings.VLLM_BASE_URL, api_key="not-needed")
+            self.model = settings.VLLM_MODEL
+        else:
+            raise ValueError(f"Unknown LLM_PROVIDER: {self.provider}")
+
+    async def chat(
+        self,
+        user_message: str,
+        history: list[dict] | None = None,
+        temperature: float = 0.2,
+        top_p: float = 1.0,
+        max_tokens: int = 800,
+        system_prompt: str | None = None,
+    ) -> str:
+        messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+        return response.choices[0].message.content
+
+    async def chat_structured(
+        self,
+        user_message: str,
+        context: str = "",
+        temperature: float = 0.2,
+        max_tokens: int = 800,
+    ) -> dict:
+        schema_instructions = """
+        Respond with ONLY a JSON object in exactly this shape, no other text:
+        {
+        "answer": "<your answer as a string>",
+        "sources": [{"document": "<filename>", "chunk_id": "<id>"}],
+        "confidence": <float between 0 and 1>
+        }
+        If you used no retrieved context, return an empty "sources" array.
+        """
+        full_system = SYSTEM_PROMPT + schema_instructions
+
+        user_content = user_message
+        if context:
+            user_content = f"Context:\n{context}\n\nQuestion:\n{user_message}"
+
+        messages = [
+            {"role": "system", "content": full_system},
+            {"role": "user", "content": user_content}
+        ]
+
+        response = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content
+        return await self._parse_json_with_repair(raw, messages)
+
+    async def chat_with_tools(
+        self,
+        user_message: str,
+        history: list[dict] | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 800,
+        max_iterations: int = 5,
+    ) -> dict:
+        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        tool_calls_made = []
+
+        for _ in range(max_iterations):
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+            )
+            choice = response.choices[0]
+            message = choice.message
+
+            if not message.tool_calls:
+                return {"answer": message.content, "tool_calls_made": tool_calls_made}
+
+            function_tool_calls = [cast(Any, tc) for tc in message.tool_calls]
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in function_tool_calls
+                ],
+            })
+
+            for tc in function_tool_calls:
+                tool_calls_made.append(tc.function.name)
+                result = execute_tool(tc.function.name, tc.function.arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        final = await self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return {"answer": final.choices[0].message.content, "tool_calls_made": tool_calls_made}
+
+    async def _parse_json_with_repair(self, raw: str, original_messages: list[dict]) -> dict:
+        import json
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            repair_messages = original_messages + [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content": "That was not valid JSON. Return ONLY the corrected valid JSON object, nothing else."},
+            ]
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=repair_messages,
+                temperature=0,
+                max_tokens=800,
+                response_format={"type": "json_object"},
+            )
+            raw_retry = response.choices[0].message.content
+            return json.loads(raw_retry)
+
+
+llm_client = LLMClient()
