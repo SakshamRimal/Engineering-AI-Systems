@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 class Settings:
     LLM_PROVIDER = os.getenv("LLM_PROVIDER", "openai")
 
@@ -17,11 +18,23 @@ class Settings:
 
     APP_HOST = os.getenv("APP_HOST", "0.0.0.0")
     APP_PORT = int(os.getenv("APP_PORT", "8000"))
-    
- 
+
+    # Retry settings
+    MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
+    RETRY_BACKOFF_BASE = float(os.getenv("RETRY_BACKOFF_BASE", "1.0"))
+    RETRY_MAX_WAIT = float(os.getenv("RETRY_MAX_WAIT", "10.0"))
+
+    # Rate limiting
+    RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "30"))
+
+    # Cache settings
+    CACHE_MAX_SIZE = int(os.getenv("CACHE_MAX_SIZE", "256"))
+    CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))
+
+    # Fallback provider (used when primary fails)
+    FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER", "")  # e.g. "ollama"
+    FALLBACK_VLLM_BASE_URL = os.getenv("FALLBACK_VLLM_BASE_URL", "http://localhost:11434/v1")
+    FALLBACK_VLLM_MODEL = os.getenv("FALLBACK_VLLM_MODEL", "llama3.2:3b")
+
 
 settings = Settings()
-
-    
-     
-     
