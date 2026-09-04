@@ -1,5 +1,8 @@
 from openai import OpenAI
 from app.config import settings
+from typing import Any, cast
+
+from app.tools import TOOL_DEFINITIONS, execute_tool
 
 # System prompt: defines role, boundaries, and when to lean on retrieved context
 SYSTEM_PROMPT = """You are a helpful, factual AI assistant.
@@ -98,6 +101,79 @@ class LLMClient:
         )
         raw = response.choices[0].message.content
         return self._parse_json_with_repair(raw, messages)
+    
+    def chat_with_tools(
+        self,
+        user_message: str,
+        history: list[dict] | None = None,
+        temperature: float = 0.2,
+        max_tokens: int = 800,
+        max_iterations: int = 5,
+    ) -> dict:
+        """
+        Runs the tool-calling loop: model may request tool calls, we execute them,
+        feed results back, repeat until the model returns a final text answer.
+        Returns: {"answer": str, "tool_calls_made": [str, ...]}
+        """
+        from app.tools import TOOL_DEFINITIONS, execute_tool
+
+        messages: list[dict[str, Any]] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        if history:
+            messages.extend(history)
+        messages.append({"role": "user", "content": user_message})
+
+        tool_calls_made = []
+
+        for _ in range(max_iterations):
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=TOOL_DEFINITIONS,
+                tool_choice="auto",
+            )
+            choice = response.choices[0]
+            message = choice.message
+
+            # No tool call requested -> model has its final answer
+            if not message.tool_calls:
+                return {"answer": message.content, "tool_calls_made": tool_calls_made}
+
+            # Append the assistant's tool-call request to the conversation
+            function_tool_calls = [cast(Any, tc) for tc in message.tool_calls]
+            messages.append({
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                    }
+                    for tc in function_tool_calls
+                ],
+            })
+
+            # Execute each requested tool call and append its result
+            for tc in function_tool_calls:
+                tool_calls_made.append(tc.function.name)
+                result = execute_tool(tc.function.name, tc.function.arguments)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        # Safety cap hit — force a final answer without further tool calls
+        final = self.client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return {"answer": final.choices[0].message.content, "tool_calls_made": tool_calls_made}
+        
     
     def _parse_json_with_repair(self, raw: str, original_messages: list[dict]) -> dict:
         import json

@@ -40,7 +40,7 @@ def query_knowledge_base(query: str) -> dict:
 
 # tool schemas (what we tell the model is available, and how to call it)
 
-TOOL_DEFINATIONS = [
+TOOL_DEFINITIONS = [
     {
         "type":"function",
         "function":{
